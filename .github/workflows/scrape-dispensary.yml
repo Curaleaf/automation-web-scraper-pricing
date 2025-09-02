@@ -1,0 +1,297 @@
+name: Dispensary Scraping Automation
+
+on:
+  # Schedule to run daily at 6 AM EST (11 AM UTC)
+  schedule:
+    - cron: '0 11 * * *'
+  
+  # Allow manual triggering for testing and on-demand runs
+  workflow_dispatch:
+    inputs:
+      max_stores_per_category:
+        description: 'Maximum stores per category (for testing)'
+        required: false
+        default: ''
+      categories_to_scrape:
+        description: 'Categories to scrape (comma-separated, e.g., "Whole Flower,Pre-Rolls")'
+        required: false
+        default: ''
+      store_in_database:
+        description: 'Store results in Snowflake database'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  scrape-dispensaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 2 hour timeout for complete scraping
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agents/dispensary_scraper/requirements.txt
+      
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Create environment file
+        run: |
+          cat > agents/dispensary_scraper/.env << EOF
+          # LLM Configuration
+          LLM_PROVIDER=openai
+          LLM_API_KEY=${{ secrets.LLM_API_KEY }}
+          LLM_MODEL=gpt-4
+          LLM_BASE_URL=https://api.openai.com/v1
+          
+          # Snowflake Configuration
+          SNOWFLAKE_ACCOUNT=${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER=${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD=${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_DATABASE=${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA=${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_WAREHOUSE=${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE=${{ secrets.SNOWFLAKE_ROLE }}
+          
+          # Application Configuration
+          APP_ENV=production
+          LOG_LEVEL=INFO
+          DEBUG=false
+          
+          # Playwright Configuration
+          PLAYWRIGHT_HEADLESS=true
+          
+          # Scraping Configuration (production values)
+          MIN_DELAY_MS=700
+          MAX_DELAY_MS=1500
+          PAGE_TIMEOUT_MS=20000
+          MAX_RETRIES=3
+          MAX_CONCURRENT_STORES=3
+          MAX_CONCURRENT_CATEGORIES=3
+          EOF
+      
+      - name: Validate configuration
+        run: |
+          cd agents/dispensary_scraper
+          python -c "
+          from settings import load_settings
+          from providers import validate_llm_configuration, validate_scraping_configuration
+          
+          print('Loading settings...')
+          settings = load_settings()
+          print(f'Loaded settings for environment: {settings.app_env}')
+          
+          print('Validating LLM configuration...')
+          llm_valid = validate_llm_configuration()
+          print(f'LLM configuration valid: {llm_valid}')
+          
+          print('Validating scraping configuration...')
+          scraping_valid = validate_scraping_configuration()
+          print(f'Scraping configuration valid: {scraping_valid}')
+          
+          if not llm_valid or not scraping_valid:
+              raise Exception('Configuration validation failed')
+          
+          print('All configurations validated successfully')
+          "
+      
+      - name: Test database connection
+        run: |
+          cd agents/dispensary_scraper
+          python -c "
+          import asyncio
+          from settings import load_settings
+          from snowflake_client import SnowflakeClient
+          
+          async def test_connection():
+              settings = load_settings()
+              config = settings.to_snowflake_config()
+              client = SnowflakeClient(config)
+              
+              print('Testing Snowflake connection...')
+              await client.connect()
+              
+              connection_test = await client.test_connection()
+              print(f'Connection test result: {connection_test}')
+              
+              if not connection_test:
+                  raise Exception('Snowflake connection test failed')
+              
+              await client.close()
+              print('Snowflake connection test successful')
+          
+          asyncio.run(test_connection())
+          "
+      
+      - name: Run dispensary scraping
+        id: scraping
+        run: |
+          cd agents/dispensary_scraper
+          python -c "
+          import asyncio
+          import sys
+          from datetime import datetime
+          from agent import run_dispensary_scraping
+          from settings import load_settings
+          
+          async def main():
+              print(f'Starting dispensary scraping at {datetime.now()}')
+              
+              # Load settings
+              settings = load_settings()
+              snowflake_config = settings.to_snowflake_config()
+              
+              # Parse workflow inputs
+              max_stores = '${{ github.event.inputs.max_stores_per_category }}'
+              max_stores = int(max_stores) if max_stores else None
+              
+              categories = '${{ github.event.inputs.categories_to_scrape }}'
+              categories = [c.strip() for c in categories.split(',')] if categories else None
+              
+              store_in_db = '${{ github.event.inputs.store_in_database }}' != 'false'
+              
+              print(f'Configuration:')
+              print(f'  Max stores per category: {max_stores or \"unlimited\"}')
+              print(f'  Categories: {categories or \"all categories\"}')
+              print(f'  Store in database: {store_in_db}')
+              print(f'  Headless mode: true')
+              
+              try:
+                  # Run the scraping workflow
+                  session = await run_dispensary_scraping(
+                      snowflake_config=snowflake_config,
+                      max_stores_per_category=max_stores,
+                      categories_to_scrape=categories,
+                      store_in_database=store_in_db,
+                      headless=True
+                  )
+                  
+                  print(f'\\nScraping completed successfully!')
+                  print(f'Session ID: {session.session_id}')
+                  print(f'Total products: {session.total_products:,}')
+                  print(f'Total stores: {session.total_stores}')
+                  print(f'Duration: {session.duration_seconds:.1f} seconds')
+                  print(f'Success: {session.success}')
+                  
+                  if session.errors:
+                      print(f'\\nErrors encountered:')
+                      for error in session.errors:
+                          print(f'  - {error}')
+                  
+                  # Print category breakdown
+                  print(f'\\nCategory breakdown:')
+                  for category, result in session.results.items():
+                      print(f'  {category}: {result.total_products:,} products from {result.store_count} stores')
+                  
+                  # Set GitHub Actions outputs
+                  print(f'::set-output name=session_id::{session.session_id}')
+                  print(f'::set-output name=total_products::{session.total_products}')
+                  print(f'::set-output name=total_stores::{session.total_stores}')
+                  print(f'::set-output name=success::{session.success}')
+                  print(f'::set-output name=duration::{session.duration_seconds:.1f}')
+                  
+                  if not session.success:
+                      print('\\nScraping completed with errors - see details above')
+                      sys.exit(1)
+                  
+              except Exception as e:
+                  print(f'\\nScraping failed with exception: {e}')
+                  print(f'::set-output name=success::false')
+                  print(f'::set-output name=error::{str(e)}')
+                  raise
+          
+          asyncio.run(main())
+          "
+      
+      - name: Run validation tests
+        if: always()  # Run even if scraping failed
+        run: |
+          cd agents/dispensary_scraper
+          echo "Running validation tests..."
+          python -m pytest tests/ -v --tb=short -k "not slow and not integration" --maxfail=5
+      
+      - name: Generate summary report
+        if: always()
+        run: |
+          echo "# Dispensary Scraping Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Execution Time:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.scraping.outputs.success }}" = "true" ]; then
+            echo "✅ **Status:** Success" >> $GITHUB_STEP_SUMMARY
+            echo "📊 **Total Products:** ${{ steps.scraping.outputs.total_products }}" >> $GITHUB_STEP_SUMMARY
+            echo "🏪 **Total Stores:** ${{ steps.scraping.outputs.total_stores }}" >> $GITHUB_STEP_SUMMARY
+            echo "⏱️ **Duration:** ${{ steps.scraping.outputs.duration }}s" >> $GITHUB_STEP_SUMMARY
+            echo "🔑 **Session ID:** ${{ steps.scraping.outputs.session_id }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Status:** Failed" >> $GITHUB_STEP_SUMMARY
+            if [ -n "${{ steps.scraping.outputs.error }}" ]; then
+              echo "🚨 **Error:** ${{ steps.scraping.outputs.error }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+      
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: scraping-logs-${{ github.run_id }}
+          path: |
+            agents/dispensary_scraper/.env
+            agents/dispensary_scraper/*.log
+          retention-days: 7
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "🚨 Dispensary scraping workflow failed!"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Check the logs and artifacts for details."
+          # In a real environment, you might send notifications via Slack, email, etc.
+          
+  notify-completion:
+    runs-on: ubuntu-latest
+    needs: scrape-dispensaries
+    if: always()
+    
+    steps:
+      - name: Send completion notification
+        run: |
+          if [ "${{ needs.scrape-dispensaries.result }}" = "success" ]; then
+            echo "✅ Dispensary scraping completed successfully"
+            echo "Products scraped: ${{ needs.scrape-dispensaries.outputs.total_products || 'N/A' }}"
+            echo "Stores processed: ${{ needs.scrape-dispensaries.outputs.total_stores || 'N/A' }}"
+            echo "Duration: ${{ needs.scrape-dispensaries.outputs.duration || 'N/A' }}s"
+          else
+            echo "❌ Dispensary scraping failed or was cancelled"
+            echo "Please check the workflow logs for details"
+          fi
+          
+          # In production, you would integrate with notification services:
+          # - Slack webhooks
+          # - Email notifications  
+          # - PagerDuty alerts
+          # - Discord notifications
+          # etc.
